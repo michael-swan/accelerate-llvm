@@ -36,9 +36,12 @@ import Data.Array.Accelerate.LLVM.PTX.Link.Object                   ( FunctionTa
 import qualified Data.Array.Accelerate.LLVM.PTX.Execute.Event       as Event
 import qualified Data.Array.Accelerate.LLVM.PTX.Execute.Stream      as Stream
 
+import Control.Monad
+import Control.Monad.Catch
 import Control.Monad.Reader
 import Control.Monad.State
 import Data.IORef
+import Data.Maybe
 
 
 -- | Evaluate a parallel computation
@@ -67,19 +70,19 @@ data Future a = Future {-# UNPACK #-} !(IORef (IVar a))
 
 data IVar a
     = Full !a
-    | Pending {-# UNPACK #-} !Event !(Maybe (Lifetime FunctionTable)) !a
-    | Empty
+    | Pending {-# UNPACK #-} !Event !(Maybe (Lifetime FunctionTable)) ![Future ()] !a
+    | Empty ![Future ()]
 
 
 instance Async PTX where
   type FutureR PTX = Future
 
   newtype Par PTX a = Par { runPar :: ReaderT ParState (LLVM PTX) a }
-    deriving ( Functor, Applicative, Monad, MonadIO, MonadReader ParState, MonadState PTX )
+    deriving ( Functor, Applicative, Monad, MonadIO, MonadReader ParState, MonadState PTX, MonadThrow, MonadCatch, MonadMask )
 
   {-# INLINEABLE new     #-}
   {-# INLINEABLE newFull #-}
-  new       = Future <$> liftIO (newIORef Empty)
+  new       = Future <$> liftIO (newIORef (Empty []))
   newFull v = Future <$> liftIO (newIORef (Full v))
 
   {-# INLINEABLE spawn #-}
@@ -104,11 +107,17 @@ instance Async PTX where
     stream <- asks ptxStream
     kernel <- asks ptxKernel
     event  <- liftPar (Event.waypoint stream)
-    ready  <- liftIO  (Event.query event)
-    liftIO . modifyIORef' ref $ \case
-      Empty -> if ready then Full v
-                        else Pending event kernel v
-      _     -> internalError "multiple put"
+    liftIO $ do
+      ready <- Event.query event
+      ivar  <- readIORef ref
+      case ivar of
+        Empty statusHandles ->
+          if ready then do
+            writeIORef ref $ Full v
+            signalCompletion statusHandles
+          else
+            writeIORef ref $ Pending event kernel statusHandles v
+        _ -> internalError "multiple put"
 
   -- Get the value of Future. Since the actual cross-stream synchronisation
   -- happens on the device, we should never have to block/reschedule the main
@@ -122,18 +131,16 @@ instance Async PTX where
       ivar <- readIORef ref
       case ivar of
         Full v            -> return v
-        Pending event k v -> do
+        Pending event k statusHandles v -> do
           ready <- Event.query event
-          if ready
-            then do
-              writeIORef ref (Full v)
-              case k of
-                Just f  -> touchLifetime f
-                Nothing -> return ()
-            else
-              Event.after event stream
+          if ready then do
+            writeIORef ref (Full v)
+            signalCompletion statusHandles
+            maybe (pure ()) touchLifetime k
+          else
+            Event.after event stream
           return v
-        Empty           -> internalError "blocked on an IVar"
+        Empty _         -> internalError "blocked on an IVar"
 
   {-# INLINEABLE block #-}
   block = liftIO . wait
@@ -141,6 +148,32 @@ instance Async PTX where
   {-# INLINE liftPar #-}
   liftPar = Par . lift
 
+  {-# INLINE statusHandle #-}
+
+  statusHandle (Future ref) = do
+    emptyFut <- new
+    fullFut <- newFull ()
+    liftIO $ atomicModifyIORef' ref $ \case
+      Full v                      -> (Full v, fullFut)
+      Empty statusHandles         -> (Empty (emptyFut:statusHandles), emptyFut)
+      Pending e k statusHandles v -> (Pending e k (emptyFut:statusHandles) v, emptyFut)
+
+  {-# INLINE poll #-}
+
+  poll (Future ref) = do
+    ivar <- liftIO $ readIORef ref
+    case ivar of
+      Full v -> return (Just v)
+      Pending event k statusHandles v -> do
+        ready <- Event.query event
+        if ready then do
+          writeIORef ref (Full v)
+          signalCompletion statusHandles
+          maybe (pure ()) touchLifetime k
+          pure (Just v)
+        else
+          pure Nothing
+      _      -> return Nothing
 
 -- | Block the calling _host_ thread until the value offered by the future is
 -- available.
@@ -150,13 +183,17 @@ wait :: Future a -> IO a
 wait (Future ref) = do
   ivar <- readIORef ref
   case ivar of
-    Full v            -> return v
-    Pending event k v -> do
+    Full v                          -> return v
+    Pending event k statusHandles v -> do
       Event.block event
       writeIORef ref (Full v)
       case k of
         Just f  -> touchLifetime f
         Nothing -> return ()
+      signalCompletion statusHandles
       return v
-    Empty           -> internalError "blocked on an IVar"
+    Empty _         -> internalError "blocked on an IVar"
+
+signalCompletion :: [Future ()] -> IO ()
+signalCompletion = mapM_ $ \(Future ref) -> writeIORef ref $ Full ()
 
