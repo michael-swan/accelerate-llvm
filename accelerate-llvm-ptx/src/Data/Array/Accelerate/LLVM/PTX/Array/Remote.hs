@@ -60,6 +60,14 @@ instance Remote.Task (Maybe Event) where
 instance Remote.RemoteMemory (LLVM PTX) where
   type RemotePtr (LLVM PTX) = CUDA.DevicePtr
   --
+  existingRemote tp ad
+    | SingleArrayDict <- singleArrayDict tp
+    , SingleDict      <- singleDict tp
+    = liftIO $
+        fmap (either (const Nothing) Just) $
+          try @CUDAException $
+            CUDA.ptrDevice <$> CUDA.getAttributes (unsafeArrayDataPtr (SingleScalarType tp) ad)
+
   mallocRemote n
     | n <= 0    = return (Just CUDA.nullDevPtr)
     | otherwise = do
